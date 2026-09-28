@@ -1,0 +1,69 @@
+#pragma once
+#include <Arduino.h>
+#include <time.h>
+
+// Logger del proyecto (formato printf)
+#include "log_serial.hpp"
+
+namespace SyncTimeUDPTask {
+
+// Zona horaria por defecto: Europa/Madrid (CET/CEST)
+#ifndef SYNC_TIME_DEFAULT_TZ
+#define SYNC_TIME_DEFAULT_TZ "CET-1CEST,M3.5.0/2,M10.5.0/3"
+#endif
+
+// Epoch mínima (1 Ene 2020) para considerar hora válida
+constexpr time_t kValidEpochThreshold = 1577836800;
+
+// Estadísticas básicas
+struct Stats {
+  bool     timeValid;        // ¿hora válida?
+  time_t   lastSyncUnix;     // última sincronización (epoch seg)
+  uint32_t lastRTTms;        // RTT última consulta (ms)
+  uint32_t okCount;          // nº sync OK
+  uint32_t errCount;         // nº errores/timeout
+};
+
+// Arranca la tarea de NTP manual por UDP (si ya está arrancada, reconfigura).
+// - tz: cadena TZ (si nullptr usa por defecto).
+// - server: host/IP del servidor NTP.
+// - pollMs: periodo entre sincronizaciones OK.
+// - responseTimeoutMs: timeout por consulta UDP.
+// - retryBackoffMs: espera tras error/timeout antes del siguiente intento.
+// - immediateQuery: si true intenta sincronizar al arrancar.
+void start(const char* tz               = SYNC_TIME_DEFAULT_TZ,
+           const char* server          = "es.pool.ntp.org",
+           uint32_t    pollMs          = 15UL * 60UL * 1000UL, // 15 min
+           uint16_t    responseTimeoutMs = 1500,
+           uint32_t    retryBackoffMs  = 10UL * 1000UL,
+           bool        immediateQuery  = true);
+
+// Detiene la tarea (opcional). Devuelve true si existía.
+bool stop();
+
+// ¿Está la tarea en ejecución?
+bool isRunning();
+
+// Cambios en caliente:
+void setServer(const char* server);
+void setTimezone(const char* tz);
+void setIntervals(uint32_t pollMs, uint16_t responseTimeoutMs, uint32_t retryBackoffMs);
+
+// Fuerza una consulta inmediata (no bloquea). Devuelve true si la lanza.
+bool forceQuery();
+
+// Consulta de estado
+bool  isTimeValid();
+time_t now();
+
+// Formatea hora local ISO-8601 con offset (ej. "2025-10-10T13:05:27+02:00").
+// Devuelve true si hay hora válida y se escribió en buf.
+bool  formatNowIso8601(char* buf, size_t bufLen);
+
+// Copia atómica de estadísticas actuales en *out*. Devuelve true si ok.
+bool  getStats(Stats* out);
+
+// Devuelve true si hay hora válida y escribe hh (0..23), mm (0..59)
+bool getHourMinute(int* hh, int* mm);
+
+} // namespace SyncTimeUDPTask

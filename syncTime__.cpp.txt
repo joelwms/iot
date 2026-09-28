@@ -1,0 +1,112 @@
+#include "syncTime.hpp"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <sys/time.h>
+#include <time.h>
+#include <inttypes.h>
+#include "log_serial.hpp" // para logging
+
+static const char* TZ_EUROPE_MADRID = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+// Puedes usar hostname o IP. Para descartar DNS usa IP directa:
+static const char* NTP_HOST    = "time.google.com";   // o "216.239.35.12"
+static const uint16_t NTP_PORT = 123;
+
+// Envía un paquete NTP y devuelve epoch (UTC) si hay respuesta en < timeoutMs.
+// Devuelve 0 si hay error/timeout.
+static uint64_t queryNtpEpochMs(uint32_t timeoutMs, const char* hostOrIp) {
+  WiFiUDP udp;
+  if (!udp.begin(0)) return 0;
+
+  // Construir paquete NTP (48 bytes)
+  uint8_t pkt[48] = {0};
+  pkt[0] = 0b11100011; // LI=3 (no sync), Version=4, Mode=3 (client) — estándar
+  // el resto a 0 es válido para una consulta simple
+
+  // Resolver destino (si es hostname)
+  IPAddress destIP;
+  if (!destIP.fromString(hostOrIp)) {
+    if (WiFi.hostByName(hostOrIp, destIP) != 1) {
+      udp.stop();
+      return 0;
+    }
+  }
+
+  // Enviar
+  if (!udp.beginPacket(destIP, NTP_PORT)) { udp.stop(); return 0; }
+  if (udp.write(pkt, sizeof(pkt)) != sizeof(pkt)) { udp.stop(); return 0; }
+  if (!udp.endPacket()) { udp.stop(); return 0; }
+
+  // Esperar respuesta con timeout
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    int len = udp.parsePacket();
+    if (len >= 48) {
+      uint8_t resp[48];
+      udp.read(resp, 48);
+      // Transmit Timestamp (bytes 40..47) es en segundos desde 1900-01-01
+      uint32_t sec1900 = (uint32_t)resp[40] << 24 |
+                         (uint32_t)resp[41] << 16 |
+                         (uint32_t)resp[42] <<  8 |
+                         (uint32_t)resp[43];
+      // Convertir a época UNIX (1970): restar 70 años en segundos
+      const uint32_t seventyYears = 2208988800UL;
+      if (sec1900 > seventyYears) {
+        uint32_t epoch = sec1900 - seventyYears;
+        udp.stop();
+        return (uint64_t)epoch * 1000ULL;
+      } else {
+        udp.stop();
+        return 0;
+      }
+    }
+    delay(10); // cede CPU
+  }
+  udp.stop();
+  return 0;
+}
+
+bool initializeTime() {
+  uint32_t totalTimeoutMs = 8000;
+  LOGI("Initializing time via direct NTP (UDP), timeout=%lu ms", (unsigned long)totalTimeoutMs);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    LOGE("WiFi not connected; aborting");
+    return false;
+  }
+
+  // Recomendado para estabilidad de red durante NTP
+  WiFi.setSleep(false);
+
+  // Configura TZ antes de cualquier conversión local
+  setenv("TZ", TZ_EUROPE_MADRID, 1);
+  tzset();
+
+  // 1º intento con hostname (o IP si pusiste IP directa)
+  uint64_t ms = queryNtpEpochMs(totalTimeoutMs, NTP_HOST);
+  if (ms == 0) {
+    // Fallback: prueba servidor alternativo o IP directa para descartar DNS
+    LOGW("Primary NTP failed, trying fallback");
+    ms = queryNtpEpochMs(totalTimeoutMs, "pool.ntp.org"); // o "216.239.35.12"
+  }
+  if (ms == 0) {
+    LOGE("NTP UDP query timeout");
+    return false;
+  }
+
+  // Fijar tiempo del sistema (UTC)
+  struct timeval tv;
+  tv.tv_sec  = (time_t)(ms / 1000ULL);
+  tv.tv_usec = (suseconds_t)((ms % 1000ULL) * 1000ULL);
+  if (settimeofday(&tv, nullptr) != 0) {
+    LOGE("settimeofday failed");
+    return false;
+  }
+
+  time_t now = time(nullptr);
+  LOGI("Time set OK. Epoch=%" PRId64, (int64_t)now);
+  return true;
+}
+
+
+syncTime *obtenerHoraActual()
+{}

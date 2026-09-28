@@ -1,6 +1,6 @@
 #include "mqtt_manager.hpp"
 #include "mqttCallback.hpp" // usa mqttOnReconnect() y el callback router
-#include "log_serial.hpp" // para logging
+#include "log_serial.hpp"   // para logging
 #include <WiFi.h>           // si no usas WiFi, elimina esta dependencia
 
 // --- Cola de salida para publish (evita usar publish desde otras tareas) ---
@@ -36,7 +36,8 @@ void mqttManagerStart(PubSubClient &client,
     if (!gMqttTxQ)
     {
         gMqttTxQ = xQueueCreate(16, sizeof(MqttTxMsg)); // ajusta tamaño
-        if (!gMqttTxQ) {
+        if (!gMqttTxQ)
+        {
             LOGE("Failed to create MQTT TX queue");
             return;
         }
@@ -46,8 +47,9 @@ void mqttManagerStart(PubSubClient &client,
     // configureMqtt(client);  // si aún no lo has llamado
 
     // xTaskCreatePinnedToCore(mqttManagerTask, "mqtt_mgr", 4096, nullptr, 2, nullptr, 1);
-    xTaskCreate(mqttManagerTask, "mqtt_mgr", 4096, nullptr, 2, nullptr);
+    xTaskCreate(mqttManagerTask, "mqtt_mgr", 4096, nullptr, 3, nullptr);
     LOGI("MQTT manager started");
+    LOGI("-----------MQTT_MAX_PACKET_SIZE: %d", MQTT_MAX_PACKET_SIZE);
 }
 
 bool mqttEnqueuePublish(const char *topic, const char *payload,
@@ -56,9 +58,9 @@ bool mqttEnqueuePublish(const char *topic, const char *payload,
     LOGD("Enqueueing publish to topic: %s, payload: %s", topic ? topic : "NULL", payload ? payload : "NULL");
     if (!gMqttTxQ || !topic || !payload)
     {
-        LOGE("Failed to enqueue publish: %s", 
-             !gMqttTxQ ? "Queue not initialized" : 
-             !topic ? "Topic is NULL" : "Payload is NULL");
+        LOGE("Failed to enqueue publish: %s",
+             !gMqttTxQ ? "Queue not initialized" : !topic ? "Topic is NULL"
+                                                          : "Payload is NULL");
         return false;
     }
     MqttTxMsg msg{};
@@ -67,9 +69,12 @@ bool mqttEnqueuePublish(const char *topic, const char *payload,
     msg.retained = retained;
     msg.qos = qos;
     bool result = xQueueSend(gMqttTxQ, &msg, timeout) == pdTRUE;
-    if (result) {
+    if (result)
+    {
         LOGI("Message successfully enqueued for topic: %s", topic);
-    } else {
+    }
+    else
+    {
         LOGE("Failed to enqueue message for topic: %s (queue full or timeout)", topic);
     }
     return result;

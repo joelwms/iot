@@ -1,0 +1,420 @@
+#include "syncTime.hpp"
+#include <WiFiUdp.h>
+#include <sys/time.h>
+#include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
+namespace SyncTimeUDPTask {
+
+static constexpr uint16_t NTP_PORT        = 123;
+static constexpr size_t   NTP_PACKET_SIZE = 48;
+static constexpr uint32_t NTP_TO_UNIX     = 2208988800UL; // 1900->1970
+
+// Config en caliente (protegida por mutex)
+static char     g_tz[64]     = SYNC_TIME_DEFAULT_TZ;
+static char     g_server[64] = "es.pool.ntp.org";
+static uint32_t g_pollMs          = 15UL * 60UL * 1000UL;
+static uint16_t g_respTimeoutMs   = 1500;
+static uint32_t g_retryBackoffMs  = 10UL * 1000UL;
+
+// Estado/estadísticas (protegidos por mutex)
+static Stats    g_stats = { false, 0, 0, 0, 0 };
+
+// Tarea y sincronización
+static TaskHandle_t    g_taskHandle = nullptr;
+static SemaphoreHandle_t g_mutex    = nullptr;
+
+// Señales a la tarea
+static volatile bool g_forceQuery = false;
+static volatile bool g_stopFlag   = false;
+
+// UDP
+static WiFiUDP  g_udp;
+static bool     g_udpBegun = false;
+
+// --- Helpers con mutex -------------------------------------------------
+static inline void lock()   { if (g_mutex) xSemaphoreTake(g_mutex, portMAX_DELAY); }
+static inline void unlock() { if (g_mutex) xSemaphoreGive(g_mutex); }
+
+// --- Funciones auxiliares ----------------------------------------------
+static void applyTZ_locked_unsafe()
+{
+  // g_tz ya está protegido por lock antes de llamar
+  setenv("TZ", g_tz, 1);
+  tzset();
+}
+
+static void buildNtpPacket(uint8_t* buf)
+{
+  memset(buf, 0, NTP_PACKET_SIZE);
+  // LI=0, VN=4, Mode=3 (cliente)
+  buf[0] = 0x23;
+  buf[1] = 0;     // Stratum
+  buf[2] = 6;     // Poll
+  buf[3] = 0xEC;  // Precision
+}
+
+static bool sendQuery_locked(uint32_t* tSendMs_out)
+{
+  // g_server bajo lock
+  if (!g_udpBegun) {
+    if (g_udp.begin(2390) == 1) {
+      g_udpBegun = true;
+    } else {
+      LOGE("NTP: UDP begin failed on port 2390.");
+      return false;
+    }
+  }
+
+  uint8_t tx[NTP_PACKET_SIZE];
+  buildNtpPacket(tx);
+
+  LOGD("NTP: send -> %s:123", g_server);
+  int r = g_udp.beginPacket(g_server, NTP_PORT);
+  if (r != 1) {
+    LOGE("NTP: beginPacket() failed.");
+    return false;
+  }
+  if (g_udp.write(tx, NTP_PACKET_SIZE) != (int)NTP_PACKET_SIZE) {
+    LOGE("NTP: write() incomplete.");
+    g_udp.endPacket();
+    return false;
+  }
+  if (g_udp.endPacket() != 1) {
+    LOGE("NTP: endPacket() failed.");
+    return false;
+  }
+  if (tSendMs_out) *tSendMs_out = millis();
+  return true;
+}
+
+static bool receiveAndApply_locked(uint32_t tSendMs)
+{
+  uint32_t start = millis();
+  for (;;) {
+    int packetSize = g_udp.parsePacket();
+    if (packetSize >= (int)NTP_PACKET_SIZE) {
+      uint8_t rx[NTP_PACKET_SIZE];
+      g_udp.read(rx, NTP_PACKET_SIZE);
+      g_udp.flush();
+
+      uint32_t sec  = (uint32_t)rx[40] << 24 | (uint32_t)rx[41] << 16 |
+                      (uint32_t)rx[42] << 8  | (uint32_t)rx[43];
+      uint32_t frac = (uint32_t)rx[44] << 24 | (uint32_t)rx[45] << 16 |
+                      (uint32_t)rx[46] << 8  | (uint32_t)rx[47];
+
+      if (sec < NTP_TO_UNIX) {
+        LOGW("NTP: invalid seconds (< 1970).");
+        return false;
+      }
+
+      time_t unixSec = (time_t)(sec - NTP_TO_UNIX);
+      // micro ≈ frac * 1e6 / 2^32 (sin float, 2 pasos)
+      uint64_t micro = ((uint64_t)frac * 1000ULL) >> 32; // ~ms
+      micro *= 1000ULL;
+
+      struct timeval tv;
+      tv.tv_sec  = unixSec;
+      tv.tv_usec = (suseconds_t)(micro & 0x7FFFFFFF);
+
+      if (settimeofday(&tv, nullptr) != 0) {
+        LOGE("NTP: settimeofday() failed.");
+        return false;
+      }
+
+      uint32_t rtt = millis() - tSendMs;
+
+      // Actualiza estadísticas
+      g_stats.timeValid   = (unixSec >= kValidEpochThreshold);
+      g_stats.lastSyncUnix= unixSec;
+      g_stats.lastRTTms   = rtt;
+      g_stats.okCount++;
+
+      LOGI("NTP: sync OK. unix=%u rtt_ms=%u", (uint32_t)unixSec, rtt);
+      return true;
+    }
+
+    if ((millis() - start) >= g_respTimeoutMs) {
+      LOGW("NTP: response timeout.");
+      return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10)); // espera cooperativa
+  }
+}
+
+static void taskLoop(void* /*param*/)
+{
+  // Copias locales para reducir tiempo bajo lock
+  uint32_t pollMs, retryMs;
+  uint16_t respTo;
+  char server[64];
+
+  lock();
+  applyTZ_locked_unsafe();
+  pollMs  = g_pollMs;
+  respTo  = g_respTimeoutMs;
+  retryMs = g_retryBackoffMs;
+  strncpy(server, g_server, sizeof(server));
+  unlock();
+
+  LOGI("NTP Task: start. server=%s pollMs=%u respTimeoutMs=%u retryBackoffMs=%u",
+       server, (unsigned)pollMs, (unsigned)respTo, (unsigned)retryMs);
+
+  uint32_t nextAllowed = 0;
+  bool     lastWasOK = false;
+
+  for (;;) {
+    if (g_stopFlag) {
+      LOGI("NTP Task: stop requested.");
+      break;
+    }
+
+    // Refresca config cada ciclo
+    lock();
+    pollMs  = g_pollMs;
+    respTo  = g_respTimeoutMs;
+    retryMs = g_retryBackoffMs;
+    strncpy(server, g_server, sizeof(server));
+    unlock();
+
+    uint32_t nowMs = millis();
+
+    bool mayQuery = g_forceQuery || (nowMs >= nextAllowed);
+    if (!mayQuery) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    g_forceQuery = false;
+
+    // Envío
+    uint32_t tSend = 0;
+    lock();
+    bool sent = sendQuery_locked(&tSend);
+    unlock();
+
+    if (!sent) {
+      // Programa reintento
+      nextAllowed = millis() + retryMs;
+      lock();
+      g_stats.errCount++;
+      unlock();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // Espera no bloqueante con parsePacket() + delay corto (en receiveAndApply_locked)
+    bool ok;
+    lock();
+    ok = receiveAndApply_locked(tSend);
+    // Reaplicar TZ por si el usuario la cambió entre tanto
+    applyTZ_locked_unsafe();
+    unlock();
+
+    if (ok) {
+      lastWasOK   = true;
+      nextAllowed = millis() + pollMs;
+    } else {
+      lastWasOK   = false;
+      nextAllowed = millis() + retryMs;
+    }
+  }
+
+  // Cierre ordenado
+  if (g_udpBegun) {
+    g_udp.stop();
+    g_udpBegun = false;
+  }
+
+  TaskHandle_t toDel = g_taskHandle;
+  g_taskHandle = nullptr;
+  vTaskDelete(toDel);
+}
+
+// --- API pública -------------------------------------------------------
+
+void start(const char* tz,
+           const char* server,
+           uint32_t    pollMs,
+           uint16_t    responseTimeoutMs,
+           uint32_t    retryBackoffMs,
+           bool        immediateQuery)
+{
+  if (!g_mutex) {
+    g_mutex = xSemaphoreCreateMutex();
+  }
+
+  lock();
+  if (tz && *tz) {
+    strncpy(g_tz, tz, sizeof(g_tz));
+    g_tz[sizeof(g_tz)-1] = '\0';
+  }
+  if (server && *server) {
+    strncpy(g_server, server, sizeof(g_server));
+    g_server[sizeof(g_server)-1] = '\0';
+  }
+  g_pollMs         = pollMs;
+  g_respTimeoutMs  = responseTimeoutMs;
+  g_retryBackoffMs = retryBackoffMs;
+  unlock();
+
+  if (immediateQuery) {
+    g_forceQuery = true;
+  }
+
+  if (g_taskHandle) {
+    LOGI("NTP Task: already running, reconfigured.");
+    return;
+  }
+
+  g_stopFlag = false;
+
+  BaseType_t ok = xTaskCreatePinnedToCore(
+      taskLoop,
+      "ntp_task",
+      4096,              // stack words
+      nullptr,
+      tskIDLE_PRIORITY,  // baja prioridad
+      &g_taskHandle,
+      tskNO_AFFINITY);
+
+  if (ok != pdPASS) {
+    LOGE("NTP Task: creation failed.");
+  } else {
+    LOGI("NTP Task: created.");
+  }
+}
+
+bool stop()
+{
+  if (!g_taskHandle) return false;
+  g_stopFlag = true;
+  // La propia tarea se borra a sí misma. Espera breve para que pare.
+  for (int i = 0; i < 50; ++i) { // ~500 ms
+    if (!g_taskHandle) break;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  bool stopped = (g_taskHandle == nullptr);
+  if (stopped) LOGI("NTP Task: stopped.");
+  return stopped;
+}
+
+bool isRunning()
+{
+  return g_taskHandle != nullptr;
+}
+
+void setServer(const char* server)
+{
+  if (!server || !*server) return;
+  lock();
+  strncpy(g_server, server, sizeof(g_server));
+  g_server[sizeof(g_server)-1] = '\0';
+  unlock();
+  LOGI("NTP: server set to '%s'", server);
+  g_forceQuery = true;
+}
+
+void setTimezone(const char* tz)
+{
+  if (!tz || !*tz) return;
+  lock();
+  strncpy(g_tz, tz, sizeof(g_tz));
+  g_tz[sizeof(g_tz)-1] = '\0';
+  applyTZ_locked_unsafe();
+  unlock();
+  LOGI("NTP: TZ set to '%s'", tz);
+}
+
+void setIntervals(uint32_t pollMs, uint16_t responseTimeoutMs, uint32_t retryBackoffMs)
+{
+  lock();
+  g_pollMs         = pollMs;
+  g_respTimeoutMs  = responseTimeoutMs;
+  g_retryBackoffMs = retryBackoffMs;
+  unlock();
+  LOGI("NTP: intervals updated. pollMs=%u respTimeoutMs=%u retryBackoffMs=%u",
+       (unsigned)pollMs, (unsigned)responseTimeoutMs, (unsigned)retryBackoffMs);
+}
+
+bool forceQuery()
+{
+  if (!g_taskHandle) return false;
+  g_forceQuery = true;
+  return true;
+}
+
+bool isTimeValid()
+{
+  time_t t = time(nullptr);
+  return t >= kValidEpochThreshold;
+}
+
+time_t now()
+{
+  return time(nullptr);
+}
+
+static bool tzOffsetNow(char* buf, size_t len)
+{
+  time_t t = time(nullptr);
+  if (t <= 0) return false;
+  struct tm lcl, gmt;
+  localtime_r(&t, &lcl);
+  gmtime_r(&t, &gmt);
+  time_t loc = mktime(&lcl);
+  time_t gmt_t = mktime(&gmt);
+  long off = (long)difftime(loc, gmt_t);
+  char sgn = (off >= 0) ? '+' : '-';
+  off = labs(off);
+  int hh = (int)(off / 3600);
+  int mm = (int)((off % 3600) / 60);
+  snprintf(buf, len, "%c%02d:%02d", sgn, hh, mm);
+  return true;
+}
+
+bool formatNowIso8601(char* buf, size_t bufLen)
+{
+  if (!buf || bufLen < 7) return false;
+  if (!isTimeValid()) return false;
+
+  time_t t = time(nullptr);
+  struct tm lt;
+  localtime_r(&t, &lt);
+
+  char base[32];
+  if (strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &lt) == 0) return false;
+
+  char off[8];
+  if (!tzOffsetNow(off, sizeof(off))) return false;
+
+  // Escribe "YYYY-MM-DDTHH:MM:SS+HH:MM"
+  int n = snprintf(buf, bufLen, "%s%s", base, off);
+  return (n > 0 && (size_t)n < bufLen);
+}
+
+bool getStats(Stats* out)
+{
+  if (!out) return false;
+  lock();
+  *out = g_stats;
+  unlock();
+  return true;
+}
+
+bool getHourMinute(int* hh, int* mm) {
+  if (!hh || !mm) return false;
+  if (!isTimeValid()) return false;
+  time_t t = time(nullptr);
+  struct tm lt;
+  localtime_r(&t, &lt);
+  *hh = lt.tm_hour;
+  *mm = lt.tm_min;
+  return true;
+}
+
+
+} // namespace SyncTimeUDPTask

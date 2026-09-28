@@ -16,6 +16,7 @@ void configureMqtt(const char *server, uint16_t port, PubSubClient &client)
 
     LOGI("MQTT configured successfully with server: %s:%d", server ? server : "NULL", port);
     mqttOnReconnect(); // suscribe todo si ya está conectado (poco probable)
+    LOGI("-----------MQTT_MAX_PACKET_SIZE: %d", MQTT_MAX_PACKET_SIZE);
 }
 
 static bool topicExists(const char *topic)
@@ -142,9 +143,17 @@ void mqttOnReconnect()
     }
     for (size_t i = 0; i < numRoutes; ++i)
     {
-        gClient->subscribe(routesArray[i].topic, routesArray[i].qos);
+        bool ok = gClient->subscribe(routesArray[i].topic, routesArray[i].qos);
+        if (!ok)
+        {
+            LOGE("Failed to resubscribe to topic: %s", routesArray[i].topic);
+        }
+        else
+        {
+            LOGI("Resubscribed successfully to topic: %s", routesArray[i].topic);
+        }
     }
-    LOGI("Resubscribed to all %zu routes successfully", numRoutes);
+    // LOGI("Resubscribed to all %zu routes successfully", numRoutes);
 }
 
 // --- Router ---

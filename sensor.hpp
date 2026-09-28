@@ -4,6 +4,7 @@
 // Configuración por instancia del sensor
 struct Sensor
 {
+    const char *name;            // name of the sensor device, e.g., "nivel_balsa"
     int pin_adc;                 // GPIO del ADC (mejor ADC1: 32..39 en ESP32)
     const char *state_topic_str; // Topic donde publicar la medida
     bool retain = false;         // Si quieres publicar retenido (normalmente false)
